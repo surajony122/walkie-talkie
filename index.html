@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="theme-color" content="#111614">
+<title>Team Walkie-Talkie</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{font-family:system-ui,-apple-system,sans-serif;background:#111614;color:#e8f0ea;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
+  .card{width:100%;max-width:380px;background:#1c2420;border-radius:28px;padding:28px 22px;box-shadow:0 20px 50px #0008;border:1px solid #2c3832}
+  h1{font-size:24px;text-align:center;margin-bottom:6px}
+  .sub{text-align:center;color:#8fa398;font-size:14px;margin-bottom:22px}
+  input{width:100%;padding:14px;border-radius:12px;border:1px solid #34423b;background:#121815;color:#fff;font-size:16px;margin-bottom:12px}
+  .btn{width:100%;padding:14px;border:0;border-radius:12px;background:#3ddc84;color:#08130d;font-weight:700;font-size:16px;cursor:pointer}
+  #err{color:#ff7a7a;text-align:center;margin-top:12px;font-size:14px;min-height:18px}
+  .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+  .chan{font-weight:700;font-size:18px}.chan small{display:block;color:#8fa398;font-weight:400;font-size:12px}
+  .leave{background:#2c3832;color:#e8f0ea;border:0;padding:8px 14px;border-radius:10px;cursor:pointer}
+  #members{list-style:none;background:#121815;border-radius:14px;padding:8px;margin-bottom:18px;min-height:52px}
+  #members li{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;font-size:15px}
+  #members li.talking{background:#3ddc8422;color:#3ddc84;font-weight:700}
+  .dot{width:9px;height:9px;border-radius:50%;background:#3ddc84;flex:none}
+  #status{text-align:center;height:24px;margin-bottom:16px;color:#8fa398;font-weight:600}
+  #status.live{color:#3ddc84}#status.me{color:#ff5c5c}
+  #ptt{display:block;margin:0 auto;width:190px;height:190px;border-radius:50%;border:8px solid #2c3832;background:radial-gradient(circle at 35% 30%,#4a5a52,#26302b);color:#e8f0ea;font-size:20px;font-weight:800;letter-spacing:1px;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:none;transition:transform .08s}
+  #ptt.on{background:radial-gradient(circle at 35% 30%,#ff7b7b,#c62828);border-color:#ff5c5c55;transform:scale(.96);box-shadow:0 0 40px #ff3b3b66}
+  .hint{text-align:center;color:#6d8076;font-size:13px;margin-top:16px}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div class="card">
+  <div id="join">
+    <h1>📻 Team Walkie</h1>
+    <p class="sub">Push-to-talk for your team</p>
+    <input id="name" placeholder="Your name" maxlength="20">
+    <input id="room" placeholder="Channel name (e.g. suraj-devteam)" maxlength="30">
+    <button class="btn" id="joinBtn">Join channel</button>
+    <p id="err"></p>
+  </div>
+
+  <div id="radio" hidden>
+    <div class="top">
+      <div class="chan"><span id="chanName"></span><small id="count"></small></div>
+      <button class="leave" id="leaveBtn">Leave</button>
+    </div>
+    <ul id="members"></ul>
+    <div id="status">Hold to talk</div>
+    <button id="ptt">PUSH<br>TO TALK</button>
+    <p class="hint">Hold the button · Spacebar on laptop · keep screen on</p>
+  </div>
+</div>
+<div id="audios" hidden></div>
+
+<script>
+const MAX = 8;                 // max people per channel
+const $ = id => document.getElementById(id);
+let peer = null, stream = null, myName = '', room = '', slot = 0, talking = false, actx = null;
+const peers = {};              // peerId -> {conn, call, name, audio, talking}
+
+try {
+  $('name').value = localStorage.getItem('wt_name') || '';
+  $('room').value = new URLSearchParams(location.search).get('room') || localStorage.getItem('wt_room') || '';
+} catch (e) {}
+
+const err = m => $('err').textContent = m;
+
+$('joinBtn').onclick = async () => {
+  myName = $('name').value.trim() || 'Anon';
+  room = $('room').value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
+  if (!room) return err('Enter a channel name');
+  try { localStorage.setItem('wt_name', myName); localStorage.setItem('wt_room', room); } catch (e) {}
+
+  err('Connecting…');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch (e) { return err('Microphone permission is required'); }
+
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  setMic(false);
+  trySlot(1);
+};
+
+// Each person grabs the first free ID: wt-<room>-1, -2, -3 …
+function trySlot(n) {
+  if (n > MAX) return err('Channel is full');
+  const p = new Peer(`wt-${room}-${n}`);
+  p.on('open', () => { peer = p; slot = n; onReady(); });
+  p.on('error', e => {
+    if (e.type === 'unavailable-id') { p.destroy(); trySlot(n + 1); }
+    else if (e.type === 'peer-unavailable') { /* empty slot */ }
+    else { console.warn(e); if (!peer) err('Connection error: ' + e.type); }
+  });
+}
+
+function onReady() {
+  $('join').hidden = true; $('radio').hidden = false; err('');
+  $('chanName').textContent = '# ' + room;
+  history.replaceState(null, '', '?room=' + room);
+  requestWakeLock();
+
+  peer.on('connection', conn => setupConn(conn, false));
+  peer.on('call', call => { call.answer(stream); setupCall(call); });
+  peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} });
+
+  for (let i = 1; i <= MAX; i++) {
+    if (i === slot) continue;
+    setupConn(peer.connect(`wt-${room}-${i}`, { reliable: true }), true);
+  }
+  render();
+}
+
+function setupConn(conn, outgoing) {
+  const id = conn.peer;
+  conn.on('open', () => {
+    const p = peers[id] = peers[id] || {};
+    p.conn = conn;
+    conn.send({ type: 'hello', name: myName });
+    if (talking) conn.send({ type: 'talk', on: true });
+    if (outgoing) setupCall(peer.call(id, stream));
+    render();
+  });
+  conn.on('data', d => {
+    const p = peers[id] = peers[id] || {};
+    if (d.type === 'hello') p.name = d.name;
+    if (d.type === 'talk') { p.talking = d.on; beep(d.on ? 1200 : 700, 0.06); }
+    render();
+  });
+  conn.on('close', () => removePeer(id));
+  conn.on('error', () => {});
+}
+
+function setupCall(call) {
+  const id = call.peer;
+  call.on('stream', remote => {
+    const p = peers[id] = peers[id] || {};
+    if (!p.audio) {
+      p.audio = document.createElement('audio');
+      p.audio.autoplay = true;
+      p.audio.setAttribute('playsinline', '');
+      $('audios').appendChild(p.audio);
+    }
+    p.audio.srcObject = remote;
+    p.audio.play().catch(() => {});
+    p.call = call;
+  });
+  call.on('error', () => {});
+}
+
+function removePeer(id) {
+  const p = peers[id]; if (!p) return;
+  if (p.audio) p.audio.remove();
+  try { p.call && p.call.close(); } catch (e) {}
+  delete peers[id];
+  render();
+}
+
+function setMic(on) { stream.getAudioTracks().forEach(t => t.enabled = on); }
+function broadcast(msg) { Object.values(peers).forEach(p => p.conn && p.conn.open && p.conn.send(msg)); }
+
+function startTalk() {
+  if (talking || !peer) return;
+  talking = true; setMic(true); beep(1000, 0.05);
+  broadcast({ type: 'talk', on: true });
+  if (navigator.vibrate) navigator.vibrate(30);
+  render();
+}
+function stopTalk() {
+  if (!talking) return;
+  talking = false; setMic(false); beep(600, 0.05);
+  broadcast({ type: 'talk', on: false });
+  render();
+}
+
+const ptt = $('ptt');
+ptt.addEventListener('pointerdown', e => { e.preventDefault(); ptt.setPointerCapture(e.pointerId); startTalk(); });
+['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => ptt.addEventListener(ev, stopTalk));
+ptt.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat && e.target.tagName !== 'INPUT') { e.preventDefault(); startTalk(); } });
+document.addEventListener('keyup', e => { if (e.code === 'Space') stopTalk(); });
+window.addEventListener('blur', stopTalk);
+
+function render() {
+  const others = Object.values(peers).filter(p => p.conn && p.conn.open);
+  const list = [{ name: myName + ' (you)', talking }, ...others.map(p => ({ name: p.name || '…', talking: p.talking }))];
+  $('members').innerHTML = list.map(m =>
+    `<li class="${m.talking ? 'talking' : ''}"><span class="dot"></span>${esc(m.name)}${m.talking ? ' 🔊' : ''}</li>`).join('');
+  $('count').textContent = list.length + (list.length === 1 ? ' person online' : ' people online');
+
+  const speaker = others.find(p => p.talking);
+  const s = $('status');
+  if (talking) { s.textContent = '🔴 You are talking…'; s.className = 'me'; }
+  else if (speaker) { s.textContent = `🔊 ${speaker.name || 'Someone'} is talking`; s.className = 'live'; }
+  else { s.textContent = 'Hold to talk'; s.className = ''; }
+  ptt.classList.toggle('on', talking);
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function beep(freq, dur) {
+  if (!actx) return;
+  try {
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.frequency.value = freq; g.gain.value = 0.08;
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (e) {}
+}
+
+async function requestWakeLock() {
+  try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && peer) requestWakeLock(); });
+
+$('leaveBtn').onclick = () => {
+  try { peer.destroy(); stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  location.href = location.pathname;
+};
+window.addEventListener('beforeunload', () => { try { peer && peer.destroy(); } catch (e) {} });
+</script>
+</body>
+</html>
