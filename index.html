@@ -30,6 +30,15 @@
   #ptt{display:block;margin:0 auto;width:190px;height:190px;border-radius:50%;border:8px solid #2c3832;background:radial-gradient(circle at 35% 30%,#4a5a52,#26302b);color:#e8f0ea;font-size:20px;font-weight:800;letter-spacing:1px;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:none;transition:transform .08s}
   #ptt.on{background:radial-gradient(circle at 35% 30%,#ff7b7b,#c62828);border-color:#ff5c5c55;transform:scale(.96);box-shadow:0 0 40px #ff3b3b66}
   .hint{text-align:center;color:#6d8076;font-size:13px;margin-top:16px}
+  .lbl{font-size:13px;color:#8fa398;margin:6px 0 8px;font-weight:600}
+  #groups{list-style:none;margin-bottom:12px}
+  #groups li{display:flex;align-items:center;gap:8px;background:#121815;border:1px solid #2c3832;border-radius:12px;padding:6px 6px 6px 14px;margin-bottom:8px}
+  #groups li .gn{flex:1;font-weight:600;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sm{border:0;border-radius:9px;padding:9px 12px;font-weight:700;cursor:pointer;background:#2c3832;color:#e8f0ea;font-size:13px}
+  .sm.go{background:#3ddc84;color:#08130d}
+  .empty{color:#6d8076;font-size:13px;text-align:center;padding:10px 0}
+  .row{display:flex;gap:8px}.row input{margin-bottom:0}.row .btn{width:auto;padding:0 16px;white-space:nowrap}
+  #switcher{background:#121815;color:#e8f0ea;border:1px solid #34423b;border-radius:10px;padding:8px;font-size:15px;font-weight:700;max-width:200px}
   [hidden]{display:none!important}
 </style>
 </head>
@@ -39,14 +48,18 @@
     <h1>📻 Team Walkie</h1>
     <p class="sub">Push-to-talk for your team</p>
     <input id="name" placeholder="Your name" maxlength="20">
-    <input id="room" placeholder="Channel name (e.g. suraj-devteam)" maxlength="30">
-    <button class="btn" id="joinBtn">Join channel</button>
+    <div class="lbl">YOUR GROUPS</div>
+    <ul id="groups"></ul>
+    <div class="row">
+      <input id="room" placeholder="New group (e.g. suraj-devteam)" maxlength="30">
+      <button class="btn" id="joinBtn">+ Add</button>
+    </div>
     <p id="err"></p>
   </div>
 
   <div id="radio" hidden>
     <div class="top">
-      <div class="chan"><span id="chanName"></span><small id="count"></small></div>
+      <div class="chan"><select id="switcher"></select><small id="count"></small></div>
       <button class="leave" id="leaveBtn">Leave</button>
     </div>
     <button id="sound" hidden>🔈 Tap to turn on sound</button>
@@ -84,37 +97,93 @@ const $ = id => document.getElementById(id);
 let peer = null, stream = null, myName = '', room = '', slot = 0, talking = false, actx = null;
 const peers = {};              // peerId -> {conn, call, name, audio, talking}
 
-try {
-  $('name').value = localStorage.getItem('wt_name') || '';
-  $('room').value = new URLSearchParams(location.search).get('room') || localStorage.getItem('wt_room') || '';
-} catch (e) {}
-
 const err = m => $('err').textContent = m;
+const clean = r => String(r || '').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+const mine = id => id.startsWith(`wt-${room}-`);
 
-$('joinBtn').onclick = async () => {
-  myName = $('name').value.trim() || 'Anon';
-  room = $('room').value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
-  if (!room) return err('Enter a channel name');
-  try { localStorage.setItem('wt_name', myName); localStorage.setItem('wt_room', room); } catch (e) {}
+// ---------- saved groups ----------
+let groups = [];
+try { groups = JSON.parse(localStorage.getItem('wt_groups') || '[]'); } catch (e) {}
+try { $('name').value = localStorage.getItem('wt_name') || ''; } catch (e) {}
+const linkRoom = clean(new URLSearchParams(location.search).get('room'));
+if (linkRoom) addGroup(linkRoom);
 
-  err('Connecting…');
+function saveGroups() { try { localStorage.setItem('wt_groups', JSON.stringify(groups)); } catch (e) {} }
+function addGroup(r) { r = clean(r); if (!r) return; groups = [r, ...groups.filter(g => g !== r)]; saveGroups(); renderGroups(); }
+function removeGroup(r) { groups = groups.filter(g => g !== r); saveGroups(); renderGroups(); }
+
+function renderGroups() {
+  const ul = $('groups');
+  ul.innerHTML = groups.length ? '' : '<div class="empty">No groups yet. Add one below.</div>';
+  groups.forEach(g => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="gn"># ${esc(g)}</span>`;
+    const share = Object.assign(document.createElement('button'), { className: 'sm', textContent: '🔗' , title: 'Copy invite link' });
+    share.onclick = () => shareGroup(g);
+    const del = Object.assign(document.createElement('button'), { className: 'sm', textContent: '✕', title: 'Remove' });
+    del.onclick = () => { if (confirm(`Remove group "${g}" from this phone?`)) removeGroup(g); };
+    const go = Object.assign(document.createElement('button'), { className: 'sm go', textContent: 'Join' });
+    go.onclick = () => joinRoom(g);
+    li.append(share, del, go);
+    ul.appendChild(li);
+  });
+  const sw = $('switcher');
+  sw.innerHTML = groups.map(g => `<option value="${esc(g)}"${g === room ? ' selected' : ''}># ${esc(g)}</option>`).join('');
+}
+
+async function shareGroup(g) {
+  const url = location.origin + location.pathname + '?room=' + encodeURIComponent(g);
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-  } catch (e) { return err('Microphone permission is required'); }
+    if (navigator.share) await navigator.share({ title: 'Join our walkie-talkie', text: `Join "${g}" on Team Walkie`, url });
+    else { await navigator.clipboard.writeText(url); alert('Invite link copied:\n' + url); }
+  } catch (e) {}
+}
 
-  actx = new (window.AudioContext || window.webkitAudioContext)();
-  setMic(false);
-  ICE = await getIceServers();
-  trySlot(1);
+$('joinBtn').onclick = () => {
+  const r = clean($('room').value);
+  if (!r) return err('Type a group name');
+  $('room').value = '';
+  addGroup(r);
+  joinRoom(r);
 };
+$('room').addEventListener('keydown', e => { if (e.key === 'Enter') $('joinBtn').click(); });
+$('switcher').onchange = e => joinRoom(e.target.value);
+
+async function joinRoom(r) {
+  myName = $('name').value.trim();
+  if (!myName) { $('name').focus(); return err('Enter your name first'); }
+  try { localStorage.setItem('wt_name', myName); } catch (e) {}
+  err('Connecting…');
+
+  if (!stream) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+    } catch (e) { return err('Microphone permission is required'); }
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    setMic(false);
+    ICE = await getIceServers();
+  }
+  leaveRoom();
+  room = r;
+  addGroup(r);
+  trySlot(1);
+}
+
+function leaveRoom() {
+  stopTalk();
+  if (peer) { try { peer.destroy(); } catch (e) {} }
+  peer = null;
+  Object.keys(peers).forEach(removePeer);
+}
 
 // Each person grabs the first free ID: wt-<room>-1, -2, -3 …
 function trySlot(n) {
   if (n > MAX) return err('Channel is full');
   const p = new Peer(`wt-${room}-${n}`, { config: { iceServers: ICE } });
-  p.on('open', () => { peer = p; slot = n; onReady(); });
+  const want = room;
+  p.on('open', () => { if (room !== want) return p.destroy(); peer = p; slot = n; onReady(); });
   p.on('error', e => {
     if (e.type === 'unavailable-id') { p.destroy(); trySlot(n + 1); }
     else if (e.type === 'peer-unavailable') { /* empty slot */ }
@@ -124,7 +193,7 @@ function trySlot(n) {
 
 function onReady() {
   $('join').hidden = true; $('radio').hidden = false; err('');
-  $('chanName').textContent = '# ' + room;
+  renderGroups();
   history.replaceState(null, '', '?room=' + room);
   requestWakeLock();
 
@@ -141,6 +210,7 @@ function onReady() {
 
 function setupConn(conn, outgoing) {
   const id = conn.peer;
+  if (!mine(id)) return conn.close();
   conn.on('open', () => {
     const p = peers[id] = peers[id] || {};
     p.conn = conn;
@@ -150,6 +220,7 @@ function setupConn(conn, outgoing) {
     render();
   });
   conn.on('data', d => {
+    if (!mine(id)) return;
     const p = peers[id] = peers[id] || {};
     if (d.type === 'hello') p.name = d.name;
     if (d.type === 'talk') { p.talking = d.on; beep(d.on ? 1200 : 700, 0.06); }
@@ -161,6 +232,7 @@ function setupConn(conn, outgoing) {
 
 function setupCall(call) {
   const id = call.peer;
+  if (!mine(id)) return call.close();
   (peers[id] = peers[id] || {}).state = 'connecting';
   const watch = () => {
     const pc = call.peerConnection;
@@ -242,7 +314,7 @@ function render() {
   else { s.textContent = 'Hold to talk'; s.className = ''; }
   ptt.classList.toggle('on', talking);
 }
-const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
 function beep(freq, dur) {
   if (!actx) return;
@@ -260,10 +332,14 @@ async function requestWakeLock() {
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && peer) requestWakeLock(); });
 
 $('leaveBtn').onclick = () => {
-  try { peer.destroy(); stream.getTracks().forEach(t => t.stop()); } catch (e) {}
-  location.href = location.pathname;
+  leaveRoom();
+  room = '';
+  history.replaceState(null, '', location.pathname);
+  $('radio').hidden = true; $('join').hidden = false; err('');
+  renderGroups();
 };
 window.addEventListener('beforeunload', () => { try { peer && peer.destroy(); } catch (e) {} });
+renderGroups();
 </script>
 </body>
 </html>
