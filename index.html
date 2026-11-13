@@ -21,7 +21,10 @@
   #members{list-style:none;background:#121815;border-radius:14px;padding:8px;margin-bottom:18px;min-height:52px}
   #members li{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;font-size:15px}
   #members li.talking{background:#3ddc8422;color:#3ddc84;font-weight:700}
-  .dot{width:9px;height:9px;border-radius:50%;background:#3ddc84;flex:none}
+  .dot{width:9px;height:9px;border-radius:50%;background:#f5b942;flex:none}
+  .dot.ok{background:#3ddc84}.dot.bad{background:#ff5c5c}
+  .st{margin-left:auto;font-size:11px;color:#8fa398;font-weight:400}
+  #sound{width:100%;padding:12px;border:0;border-radius:12px;background:#f5b942;color:#1a1300;font-weight:700;margin-bottom:14px;cursor:pointer}
   #status{text-align:center;height:24px;margin-bottom:16px;color:#8fa398;font-weight:600}
   #status.live{color:#3ddc84}#status.me{color:#ff5c5c}
   #ptt{display:block;margin:0 auto;width:190px;height:190px;border-radius:50%;border:8px solid #2c3832;background:radial-gradient(circle at 35% 30%,#4a5a52,#26302b);color:#e8f0ea;font-size:20px;font-weight:800;letter-spacing:1px;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:none;transition:transform .08s}
@@ -46,6 +49,7 @@
       <div class="chan"><span id="chanName"></span><small id="count"></small></div>
       <button class="leave" id="leaveBtn">Leave</button>
     </div>
+    <button id="sound" hidden>🔈 Tap to turn on sound</button>
     <ul id="members"></ul>
     <div id="status">Hold to talk</div>
     <button id="ptt">PUSH<br>TO TALK</button>
@@ -56,6 +60,26 @@
 
 <script>
 const MAX = 8;                 // max people per channel
+// Optional: your own Metered TURN URL, e.g. https://APPNAME.metered.live/api/v1/turn/credentials?apiKey=KEY
+const METERED_URL = '';
+let ICE = null;
+
+async function getIceServers() {
+  const stun = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }, { urls: 'stun:stun.relay.metered.ca:80' }];
+  if (METERED_URL) {
+    try { const r = await fetch(METERED_URL); return stun.concat(await r.json()); } catch (e) {}
+  }
+  // Free Open Relay TURN (time-limited credentials via shared-secret auth)
+  try {
+    const username = (Math.floor(Date.now() / 1000) + 24 * 3600) + ':walkie';
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode('openrelayprojectsecret'), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(username));
+    const credential = btoa(String.fromCharCode(...new Uint8Array(sig)));
+    const h = 'staticauth.openrelay.metered.ca';
+    return stun.concat([{ urls: [`turn:${h}:80`, `turn:${h}:80?transport=tcp`, `turn:${h}:443`, `turns:${h}:443?transport=tcp`], username, credential }]);
+  } catch (e) { return stun; }
+}
 const $ = id => document.getElementById(id);
 let peer = null, stream = null, myName = '', room = '', slot = 0, talking = false, actx = null;
 const peers = {};              // peerId -> {conn, call, name, audio, talking}
@@ -82,13 +106,14 @@ $('joinBtn').onclick = async () => {
 
   actx = new (window.AudioContext || window.webkitAudioContext)();
   setMic(false);
+  ICE = await getIceServers();
   trySlot(1);
 };
 
 // Each person grabs the first free ID: wt-<room>-1, -2, -3 …
 function trySlot(n) {
   if (n > MAX) return err('Channel is full');
-  const p = new Peer(`wt-${room}-${n}`);
+  const p = new Peer(`wt-${room}-${n}`, { config: { iceServers: ICE } });
   p.on('open', () => { peer = p; slot = n; onReady(); });
   p.on('error', e => {
     if (e.type === 'unavailable-id') { p.destroy(); trySlot(n + 1); }
@@ -136,6 +161,14 @@ function setupConn(conn, outgoing) {
 
 function setupCall(call) {
   const id = call.peer;
+  (peers[id] = peers[id] || {}).state = 'connecting';
+  const watch = () => {
+    const pc = call.peerConnection;
+    if (!pc) return setTimeout(watch, 200);
+    const upd = () => { const p = peers[id]; if (p) { p.state = pc.iceConnectionState; render(); } };
+    pc.addEventListener('iceconnectionstatechange', upd); upd();
+  };
+  watch();
   call.on('stream', remote => {
     const p = peers[id] = peers[id] || {};
     if (!p.audio) {
@@ -145,8 +178,8 @@ function setupCall(call) {
       $('audios').appendChild(p.audio);
     }
     p.audio.srcObject = remote;
-    p.audio.play().catch(() => {});
     p.call = call;
+    playAll();
   });
   call.on('error', () => {});
 }
@@ -158,6 +191,15 @@ function removePeer(id) {
   delete peers[id];
   render();
 }
+
+function playAll() {
+  if (actx && actx.state === 'suspended') actx.resume().catch(() => {});
+  let blocked = false;
+  const jobs = Object.values(peers).filter(p => p.audio).map(p => p.audio.play().catch(() => { blocked = true; }));
+  Promise.all(jobs).then(() => { $('sound').hidden = !blocked; });
+}
+$('sound').onclick = playAll;
+document.addEventListener('pointerdown', playAll, true);
 
 function setMic(on) { stream.getAudioTracks().forEach(t => t.enabled = on); }
 function broadcast(msg) { Object.values(peers).forEach(p => p.conn && p.conn.open && p.conn.send(msg)); }
@@ -186,9 +228,11 @@ window.addEventListener('blur', stopTalk);
 
 function render() {
   const others = Object.values(peers).filter(p => p.conn && p.conn.open);
-  const list = [{ name: myName + ' (you)', talking }, ...others.map(p => ({ name: p.name || '…', talking: p.talking }))];
+  const label = s => ({ connected: 'voice ok', completed: 'voice ok', checking: 'connecting…', new: 'connecting…', connecting: 'connecting…', failed: 'voice blocked', disconnected: 'reconnecting…', closed: 'closed' }[s] || 'no voice yet');
+  const cls = s => (s === 'connected' || s === 'completed') ? 'ok' : (s === 'failed' || s === 'closed') ? 'bad' : '';
+  const list = [{ name: myName + ' (you)', talking, me: true }, ...others.map(p => ({ name: p.name || '…', talking: p.talking, state: p.state }))];
   $('members').innerHTML = list.map(m =>
-    `<li class="${m.talking ? 'talking' : ''}"><span class="dot"></span>${esc(m.name)}${m.talking ? ' 🔊' : ''}</li>`).join('');
+    `<li class="${m.talking ? 'talking' : ''}"><span class="dot ${m.me ? 'ok' : cls(m.state)}"></span>${esc(m.name)}${m.talking ? ' 🔊' : ''}${m.me ? '' : `<span class="st">${label(m.state)}</span>`}</li>`).join('');
   $('count').textContent = list.length + (list.length === 1 ? ' person online' : ' people online');
 
   const speaker = others.find(p => p.talking);
